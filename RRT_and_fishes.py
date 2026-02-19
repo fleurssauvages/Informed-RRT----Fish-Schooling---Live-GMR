@@ -18,6 +18,7 @@ import numba
 import time
 import pickle
 import copy
+from numba import njit, prange
 
 from RRTstar_reroute import iterative_blocking_rrtstar, PolyObstacle, plot_tree_and_routes
 from RL.env2D import FishGoalEnv2D, get_terminal_goals
@@ -208,27 +209,112 @@ def compute_occupancy(boid_pos, bins=100, bounds=(0,40)):
 
     return H.T, [xmin, xmax, ymin, ymax]  # transpose for imshow
 
-def select_demos_2d(boid_pos_TN2, history_points_2d, n_demos=15, time_stride=5):
+@njit(parallel=True, fastmath=True)
+def _min_d2_history_per_boid(pos_TN2, hist_H2):
     """
-    boid_pos_TN2: (T, N, 2)
-    history_points_2d: (H, 2) array
-    Select demos (boid trajectories) whose trajectory gets closest to the last history point.
-    Return list of (T', 2) arrays.
+    pos_TN2: (Ts, N, 2) float32/float64
+    hist_H2: (H, 2)
+
+    Returns:
+        min_d2_HN: (H, N) where min_d2_HN[h,j] = min_t ||pos[t,j]-hist[h]||^2
     """
+    Ts, N, _ = pos_TN2.shape
+    H = hist_H2.shape[0]
+    out = np.empty((H, N), dtype=pos_TN2.dtype)
+
+    for j in prange(N):
+        for h in range(H):
+            hx = hist_H2[h, 0]
+            hy = hist_H2[h, 1]
+            best = 1e30
+            for t in range(Ts):
+                dx = pos_TN2[t, j, 0] - hx
+                dy = pos_TN2[t, j, 1] - hy
+                d2 = dx*dx + dy*dy
+                if d2 < best:
+                    best = d2
+            out[h, j] = best
+    return out
+
+
+@njit(parallel=True, fastmath=True)
+def _scores_from_min_d2(min_d2_HN, w_H):
+    """
+    min_d2_HN: (H,N)
+    w_H: (H,)
+    Returns scores (N,)
+    """
+    H, N = min_d2_HN.shape
+    scores = np.empty(N, dtype=min_d2_HN.dtype)
+
+    for j in prange(N):
+        s = 0.0
+        for h in range(H):
+            s += w_H[h] * min_d2_HN[h, j]
+        scores[j] = s
+    return scores
+
+
+def select_demos_2d(
+    boid_pos_TN2,
+    history_points_2d,
+    n_demos=15,
+    time_stride=5,
+    score_time_stride=6,
+    max_history=120,
+    decay=0.08,
+    dtype=np.float32
+):
+    """
+    Numba-accelerated selection:
+    score[j] = sum_h w[h] * min_t ||pos[t,j] - hist[h]||^2
+
+    Much lower memory than broadcasted numpy.
+    """
+
     T, N, _ = boid_pos_TN2.shape
-    target = np.asarray(history_points_2d[-1], dtype=float).reshape(1, 1, 2)  # (1,1,2)
 
-    # distance of each boid to target over time: (T,N)
-    d2 = np.sum((boid_pos_TN2 - target) ** 2, axis=2)
-    # best approach per boid
-    best = np.min(d2, axis=0)  # (N,)
-    idx = np.argsort(best)[: min(n_demos, N)]
+    # history
+    hist = np.asarray(history_points_2d, dtype=dtype)
+    if hist.shape[0] == 0:
+        return []
+    if hist.shape[0] > max_history:
+        hist = hist[-max_history:]
+    H = hist.shape[0]
 
-    demos = []
-    for j in idx:
-        traj = boid_pos_TN2[::time_stride, j, :]  # (T',2)
-        demos.append(traj.astype(np.float64))
+    # weights (recent history emphasized)
+    idx = np.arange(H, dtype=dtype)
+    w = np.exp(-decay * (H - 1 - idx))
+    w /= (w.sum() + 1e-12)
+
+    # scoring positions (downsample time)
+    pos = np.asarray(boid_pos_TN2[::score_time_stride], dtype=dtype)  # ensure contiguous enough
+    # Numba kernel
+    min_d2 = _min_d2_history_per_boid(pos, hist)
+    scores = _scores_from_min_d2(min_d2, w)
+
+    # top-k (numpy is fine here)
+    k = min(n_demos, N)
+    idx_best = np.argpartition(scores, k-1)[:k]
+    idx_best = idx_best[np.argsort(scores[idx_best])]
+
+    demos = [boid_pos_TN2[::time_stride, j, :].astype(np.float64) for j in idx_best]
     return demos
+
+def crop_demos_forward_from_point(pos_demos, current_xy, min_len=10):
+    """
+    For each demo (T,2), find t* closest to current_xy and return demo[t*:].
+    Drops demos that become too short.
+    """
+    cur = np.asarray(current_xy, dtype=float).reshape(1, 2)
+    cropped = []
+    for traj in pos_demos:
+        d2 = np.sum((traj - cur) ** 2, axis=1)
+        t0 = int(np.argmin(d2))
+        tr = traj[t0:]
+        if tr.shape[0] >= min_len:
+            cropped.append(tr)
+    return cropped
 
 def chaikin_closed(poly, n_iters=2):
     """
@@ -580,17 +666,17 @@ if __name__ == "__main__":
     plt.show()
 
     # --- GMR parameters (mirrors your example :contentReference[oaicite:5]{index=5} ) ---
-    boid_pos= boid_pos_RTT
+    boid_pos= boid_pos_RTT_transitions
     nonzero_mask = np.any(np.abs(boid_pos) > 0.5, axis=(1,2))
     boid_pos = boid_pos[nonzero_mask]
 
     max_steps = 600
-    n_demos = 15
-    time_stride = 1
-    n_components = 6
+    n_demos = 5
+    time_stride = 5
+    n_components = 12
     cov_type = "full"
 
-    history_len = 8
+    history_len = 12
     update_period = 0.08
     update_iters = 10
     move_eps = 1e-3
@@ -661,6 +747,12 @@ if __name__ == "__main__":
     spm = SpaceMouse3D(trans_scale=10.0, deadzone=0.0, lowpass=0.0, rate_hz=200)
     spm.start()
 
+    mu_new, Sigma_new, _, _ = gmr.regress(T=max_steps, pos_dim=3)
+    f_cut = 3
+    tau = 1/(2*np.pi*f_cut)
+    dt_visu = 1/60
+    blend = dt_visu / (tau + dt_visu)
+
     plt.ion()
     while plt.fignum_exists(fig.number):
         now = time.time()
@@ -690,18 +782,24 @@ if __name__ == "__main__":
             last_x_for_update = x.copy()
 
             pos_demos = select_demos_2d(boid_pos, np.array(history), n_demos=n_demos, time_stride=time_stride)
+            pos_demos = crop_demos_forward_from_point(pos_demos, current_xy=history[-1], min_len=12)
 
-            gmrUpdate = copy.deepcopy(gmr)
-            gmrUpdate.update(pos_demos, n_iter=update_iters)
-            mu_y, Sigma_y, gamma, loglik = gmrUpdate.regress(T=max_steps, pos_dim=2)
+            gmr = GMRGMM(n_components=n_components, seed=0, cov_type=cov_type)
+            gmr.fit(pos_demos)
+            mu_new, Sigma_new, _, _ = gmr.regress(T=max_steps, pos_dim=3)
+            mu_y = (1 - blend) * mu_y + blend * mu_new
+            Sigma_y = (1 - blend) * Sigma_y + blend * Sigma_new
 
             set_demo_lines(pos_demos, 0)
             mu_line.set_data(mu_y[0:, 0], mu_y[0:, 1])
 
             remove_lines(cov_lines)
             cov_lines[:] = add_cov_ellipses(ax, mu_y[0:], Sigma_y[0:], step=25, n_std=1.5, alpha=0.3)
+        else:
+            mu_y = (1 - blend) * mu_y + blend * mu_new
+            Sigma_y = (1 - blend) * Sigma_y + blend * Sigma_new
 
-        plt.pause(0.01)
+        plt.pause(dt_visu)
 
         if np.linalg.norm(buttons) > 0.5: # Restart by pressing a button
             x = start.astype(float).copy()
