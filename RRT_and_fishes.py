@@ -254,6 +254,66 @@ def _scores_from_min_d2(min_d2_HN, w_H):
         scores[j] = s
     return scores
 
+@njit(parallel=True, fastmath=True)
+def _ordered_scores_monotone_window(pos_TN2, hist_H2, w_H, win=64):
+    """
+    pos_TN2: (Ts, N, 2)
+    hist_H2: (H, 2)
+    w_H: (H,)
+    win: lookahead window (in trajectory indices)
+
+    For each boid j:
+      t_prev = 0
+      for h=0..H-1:
+         search t in [t_prev, min(Ts-1, t_prev+win)] for min dist
+         t_prev = argmin_t
+         score += w[h] * min_dist
+    """
+    Ts, N, _ = pos_TN2.shape
+    H = hist_H2.shape[0]
+    scores = np.empty(N, dtype=pos_TN2.dtype)
+
+    for j in prange(N):
+        t_prev = 0
+        s = 0.0
+
+        for h in range(H):
+            hx = hist_H2[h, 0]
+            hy = hist_H2[h, 1]
+
+            t_end = t_prev + win
+            if t_end >= Ts:
+                t_end = Ts - 1
+
+            best = 1e30
+            best_t = t_prev
+
+            # search forward only
+            for t in range(t_prev, t_end + 1):
+                dx = pos_TN2[t, j, 0] - hx
+                dy = pos_TN2[t, j, 1] - hy
+                d2 = dx*dx + dy*dy
+                if d2 < best:
+                    best = d2
+                    best_t = t
+
+            t_prev = best_t
+            s += w_H[h] * best
+
+            # early stop: if we reached the end, remaining history points can’t advance
+            if t_prev >= Ts - 1 and h < H - 1:
+                # penalize remaining points as if they match last point
+                lastx = pos_TN2[Ts - 1, j, 0]
+                lasty = pos_TN2[Ts - 1, j, 1]
+                for hh in range(h + 1, H):
+                    dx = lastx - hist_H2[hh, 0]
+                    dy = lasty - hist_H2[hh, 1]
+                    s += w_H[hh] * (dx*dx + dy*dy)
+                break
+
+        scores[j] = s
+
+    return scores
 
 def select_demos_2d(
     boid_pos_TN2,
@@ -263,18 +323,16 @@ def select_demos_2d(
     score_time_stride=6,
     max_history=120,
     decay=0.08,
+    win=64,
     dtype=np.float32
 ):
     """
-    Numba-accelerated selection:
-    score[j] = sum_h w[h] * min_t ||pos[t,j] - hist[h]||^2
-
-    Much lower memory than broadcasted numpy.
+    Order-aware demo selection using monotone time matching with a forward window.
+    Much faster than DTW and enforces chronological consistency.
     """
 
     T, N, _ = boid_pos_TN2.shape
 
-    # history
     hist = np.asarray(history_points_2d, dtype=dtype)
     if hist.shape[0] == 0:
         return []
@@ -282,20 +340,17 @@ def select_demos_2d(
         hist = hist[-max_history:]
     H = hist.shape[0]
 
-    # weights (recent history emphasized)
+    # weights: more weight to recent history (end of hist)
     idx = np.arange(H, dtype=dtype)
     w = np.exp(-decay * (H - 1 - idx))
     w /= (w.sum() + 1e-12)
 
-    # scoring positions (downsample time)
-    pos = np.asarray(boid_pos_TN2[::score_time_stride], dtype=dtype)  # ensure contiguous enough
-    # Numba kernel
-    min_d2 = _min_d2_history_per_boid(pos, hist)
-    scores = _scores_from_min_d2(min_d2, w)
+    pos = np.asarray(boid_pos_TN2[::score_time_stride], dtype=dtype)  # (Ts,N,2)
 
-    # top-k (numpy is fine here)
+    scores = _ordered_scores_monotone_window(pos, hist, w, win=win)
+
     k = min(n_demos, N)
-    idx_best = np.argpartition(scores, k-1)[:k]
+    idx_best = np.argpartition(scores, k - 1)[:k]
     idx_best = idx_best[np.argsort(scores[idx_best])]
 
     demos = [boid_pos_TN2[::time_stride, j, :].astype(np.float64) for j in idx_best]
@@ -676,7 +731,7 @@ if __name__ == "__main__":
     n_components = 12
     cov_type = "full"
 
-    history_len = 12
+    history_len = 36
     update_period = 0.08
     update_iters = 10
     move_eps = 1e-3

@@ -47,7 +47,7 @@ def compute_alpha(
 
         g_sigma = _sigmoid(k_s * (s0 - s))  # smaller s -> closer to 1
 
-        alpha_star = alpha_max * g_align
+        alpha_star = alpha_max * g_sigma * g_align
 
     # clamp
     alpha = max(0.0, min(alpha_max, alpha_star))
@@ -211,3 +211,76 @@ def make_ref_trajs(list_of_point_lists, step=0.02, min_points_per_seg=10):
         ref_trajs.append(traj)
 
     return ref_trajs
+
+def segs_to_wall_mesh(segs, height=10_000.0, thickness=0.05, z0=0.0, cap=True):
+    """
+    segs: (N,4) with [x1,y1,x2,y2]
+    Returns:
+      verts: (M,3)
+      faces: (K,3) int32 triangle indices
+    """
+    segs = np.asarray(segs, dtype=np.float32)
+    verts_all = []
+    faces_all = []
+    v_off = 0
+
+    for x1, y1, x2, y2 in segs:
+        p1 = np.array([x1, y1], dtype=np.float32)
+        p2 = np.array([x2, y2], dtype=np.float32)
+        d = p2 - p1
+        L = float(np.linalg.norm(d))
+        if L < 1e-8:
+            continue
+
+        # unit normal to the segment (2D)
+        n = np.array([-d[1], d[0]], dtype=np.float32) / L
+        o = 0.5 * thickness * n
+
+        # bottom rectangle corners (counter-clockwise around the segment)
+        b0 = p1 + o
+        b1 = p2 + o
+        b2 = p2 - o
+        b3 = p1 - o
+
+        z1 = z0 + float(height)
+
+        # 8 vertices: bottom then top
+        v = np.array([
+            [b0[0], b0[1], z0],
+            [b1[0], b1[1], z0],
+            [b2[0], b2[1], z0],
+            [b3[0], b3[1], z0],
+            [b0[0], b0[1], z1],
+            [b1[0], b1[1], z1],
+            [b2[0], b2[1], z1],
+            [b3[0], b3[1], z1],
+        ], dtype=np.float32)
+
+        # triangles (two per quad face)
+        # side faces:
+        f = [
+            [0, 1, 5], [0, 5, 4],  # +o side
+            [1, 2, 6], [1, 6, 5],  # end at p2
+            [2, 3, 7], [2, 7, 6],  # -o side
+            [3, 0, 4], [3, 4, 7],  # end at p1
+        ]
+
+        if cap:
+            # bottom cap (z0) and top cap (z1)
+            f += [
+                [0, 2, 1], [0, 3, 2],  # bottom
+                [4, 5, 6], [4, 6, 7],  # top
+            ]
+
+        f = np.array(f, dtype=np.int32) + v_off
+
+        verts_all.append(v)
+        faces_all.append(f)
+        v_off += v.shape[0]
+
+    if not verts_all:
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int32)
+
+    verts = np.vstack(verts_all)
+    faces = np.vstack(faces_all)
+    return verts, faces
