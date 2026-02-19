@@ -137,6 +137,52 @@ Fish probabilistically transition through this graph.
 
 ---
 
+## 🔀 Mid-Route Transitions Between Distinct Paths
+
+To enable controlled cross-route exploration, we augment the goal graph with **straight-line transitions between routes**.
+
+### 🎯 Motivation
+
+Without transitions:
+- Each RRT* path behaves as an independent corridor
+- Fish remain confined to their initial route
+
+With transitions:
+- Agents may switch routes mid-trajectory
+- Dense flow naturally redistributes
+- Multi-modal occupation maps emerge
+
+---
+
+### 📍 Transition Placement Strategy
+
+Transitions are created:
+
+1. **At predefined fractional positions along each route**
+   - Example:
+     - Middle → `0.5`
+     - Thirds → `1/3`, `2/3`
+     - Quarters → `0.25`, `0.5`, `0.75`
+
+2. For each selected node:
+   - Find the **closest node on every other route**
+   - If distance < X
+   - And the straight segment does **not intersect obstacles**
+   - Add a directed transition edge
+
+---
+
+### 🧱 Collision Constraint
+
+A transition is only added if the straight line between two nodes:
+
+- Does not intersect any obstacle segment
+- Does not skim obstacle edges (touching counts as collision)
+
+This preserves geometric feasibility.
+
+---
+
 # 4️⃣ Dense & Diverse Exploration
 
 Running hundreds of agents per route produces:
@@ -156,13 +202,19 @@ This yields a high-quality demonstration set.
 
 ### 🔹 Fish without RTT midpoints
 <div align="center">
-<img src="images/fishesNORTT.gif" width="600" alt="GMR">
+<img src="images/fishesNORTT.gif" width="600" alt="NoRTT">
 </div>
 
 ### 🔹 Fish with RTT midpoints
 <div align="center">
-<img src="images/fishesRTT.gif" width="600" alt="GMR">
+<img src="images/fishesRTT.gif" width="600" alt="RTT">
 </div>
+
+### 🔹 Fish with RTT and Transitions
+<div align="center">
+<img src="images/fishesRTTandTransitions.gif" width="600" alt="RTT_Trans">
+</div>
+
 
 ### 🔹 Occupation Map Comparision
 <div align="center">

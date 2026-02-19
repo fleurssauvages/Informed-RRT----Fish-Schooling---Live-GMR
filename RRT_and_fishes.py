@@ -73,17 +73,13 @@ def _merge_or_add(nodes, p, tol):
     return len(nodes) - 1
 
 
-def build_goal_graph_from_paths(paths_xy, merge_tol=0.5, terminal_self_weight=1.0, scale = 1.0):
-    """
-    paths_xy: list of arrays, each (Ti,2)
-    merge_tol: distance for merging waypoints across paths
-    Returns:
-      goals (G,2), goal_W (G,G), start_goal_idx
-    """
-    nodes = []                # list of (2,)
-    edges = {}                # dict: (u,v) -> count/weight
+def build_goal_graph_from_paths(paths_xy, merge_tol=0.5, terminal_self_weight=1.0, scale=1.0):
+    nodes = []
+    edges = {}
     start_idx = None
     terminal_nodes = set()
+
+    route_node_lists = []   # NEW: list of lists of node ids (one per route)
 
     for path in paths_xy:
         path = np.asarray(path, dtype=np.float32) * scale
@@ -91,8 +87,10 @@ def build_goal_graph_from_paths(paths_xy, merge_tol=0.5, terminal_self_weight=1.
         for k in range(path.shape[0]):
             idxs.append(_merge_or_add(nodes, path[k], merge_tol))
 
+        route_node_lists.append(idxs)  # NEW
+
         if start_idx is None:
-            start_idx = idxs[0]          # choose the first path's start as env start goal
+            start_idx = idxs[0]
         terminal_nodes.add(idxs[-1])
 
         for a, b in zip(idxs[:-1], idxs[1:]):
@@ -102,13 +100,11 @@ def build_goal_graph_from_paths(paths_xy, merge_tol=0.5, terminal_self_weight=1.
     G = goals.shape[0]
     goal_W = np.zeros((G, G), dtype=np.float32)
 
-    # Fill outgoing weights from edge counts
     out_sum = np.zeros(G, dtype=np.float32)
     for (a, b), w in edges.items():
         goal_W[a, b] += w
         out_sum[a] += w
 
-    # Normalize rows for nonterminal nodes (so _weighted_next_goal behaves nicely)
     for a in range(G):
         if a in terminal_nodes:
             continue
@@ -116,12 +112,12 @@ def build_goal_graph_from_paths(paths_xy, merge_tol=0.5, terminal_self_weight=1.
         if s > 1e-12:
             goal_W[a, :] /= s
 
-    # Mark terminal nodes as pure self-loops (required by _is_terminal_goal)
     for t in terminal_nodes:
         goal_W[t, :] = 0.0
         goal_W[t, t] = float(terminal_self_weight)
 
-    return goals, goal_W, int(start_idx if start_idx is not None else 0)
+    return goals, goal_W, int(start_idx if start_idx is not None else 0), route_node_lists, terminal_nodes
+
 
 def resample_polyline_by_step(path, step=2.0):
     path = np.asarray(path, dtype=np.float32)
@@ -282,6 +278,154 @@ def round_obstacle(poly, n_iters=2, n_points=16):
     rounded = resample_closed_polyline(smooth, n_points=n_points)
     return rounded
 
+def _orient(a, b, c):
+    # 2D cross product (b-a) x (c-a)
+    return (b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0])
+
+def _on_segment(a, b, c, eps=1e-9):
+    # c colinear with a-b, and within bounding box
+    return (min(a[0], b[0]) - eps <= c[0] <= max(a[0], b[0]) + eps and
+            min(a[1], b[1]) - eps <= c[1] <= max(a[1], b[1]) + eps)
+
+def _seg_intersect(p1, p2, q1, q2, eps=1e-9):
+    o1 = _orient(p1, p2, q1)
+    o2 = _orient(p1, p2, q2)
+    o3 = _orient(q1, q2, p1)
+    o4 = _orient(q1, q2, p2)
+
+    # general case
+    if (o1 > eps and o2 < -eps or o1 < -eps and o2 > eps) and \
+       (o3 > eps and o4 < -eps or o3 < -eps and o4 > eps):
+        return True
+
+    # colinear / touching cases
+    if abs(o1) <= eps and _on_segment(p1, p2, q1, eps): return True
+    if abs(o2) <= eps and _on_segment(p1, p2, q2, eps): return True
+    if abs(o3) <= eps and _on_segment(q1, q2, p1, eps): return True
+    if abs(o4) <= eps and _on_segment(q1, q2, p2, eps): return True
+    return False
+
+def segment_crosses_obstacles(p, q, segs, eps=1e-9):
+    """
+    segs: (M,4) array [x1,y1,x2,y2] for obstacle polygon edges
+    Returns True if segment p-q intersects/touches any obstacle edge.
+    """
+    p = np.asarray(p, dtype=float)
+    q = np.asarray(q, dtype=float)
+    for x1, y1, x2, y2 in segs:
+        r1 = np.array([x1, y1], dtype=float)
+        r2 = np.array([x2, y2], dtype=float)
+        if _seg_intersect(p, q, r1, r2, eps=eps):
+            return True
+    return False
+
+def pick_route_fraction_nodes(route_node_lists, fractions=(0.5,)):
+    """
+    Return for each route a list of node-ids picked at given fractions of the route length.
+    fractions in [0,1], e.g. (0.5,) for middle, (1/3,2/3) for thirds.
+    """
+    picked = []
+    for idxs in route_node_lists:
+        n = len(idxs)
+        if n == 0:
+            picked.append([])
+            continue
+
+        nodes = []
+        for f in fractions:
+            f = float(f)
+            k = int(round(f * (n - 1)))
+            k = max(0, min(n - 1, k))
+            nodes.append(idxs[k])
+
+        # unique while keeping order
+        uniq = []
+        seen = set()
+        for u in nodes:
+            if u not in seen:
+                uniq.append(u)
+                seen.add(u)
+        picked.append(uniq)
+    return picked
+
+
+def add_fractional_closest_transitions(
+    goals,
+    goal_W,
+    route_node_lists,
+    terminal_nodes,
+    segs,
+    X=8.0,
+    fractions=(0.5,),
+    transition_weight=0.25,
+    eps=1e-9,
+):
+    """
+    For each route i:
+      - pick source nodes at specified fractions along route i
+      - for each source node u:
+          for each other route j:
+              find v in route j minimizing distance ||goals[u]-goals[v]||
+              if dist <= X and segment(u,v) does not cross obstacles:
+                  add transition u->v
+
+    Then renormalize nonterminal rows of goal_W.
+    """
+    G = goals.shape[0]
+    goal_W = goal_W.copy()
+
+    # precompute arrays for each route for fast closest-point search
+    route_pos = []
+    for idxs in route_node_lists:
+        idxs_arr = np.asarray(idxs, dtype=int)
+        if idxs_arr.size == 0:
+            route_pos.append((idxs_arr, np.empty((0, 2), dtype=float)))
+        else:
+            route_pos.append((idxs_arr, goals[idxs_arr]))
+
+    source_nodes_per_route = pick_route_fraction_nodes(route_node_lists, fractions=fractions)
+
+    for i, sources in enumerate(source_nodes_per_route):
+        for u in sources:
+            if u in terminal_nodes:
+                continue
+
+            pu = goals[u]
+
+            for j, (idxs_j, pos_j) in enumerate(route_pos):
+                if j == i or idxs_j.size == 0:
+                    continue
+
+                # closest node on route j
+                d2 = np.sum((pos_j - pu) ** 2, axis=1)
+                k = int(np.argmin(d2))
+                v = int(idxs_j[k])
+                d = float(np.sqrt(d2[k]))
+
+                if d > X:
+                    continue
+
+                # collision check
+                if segment_crosses_obstacles(pu, goals[v], segs, eps=eps):
+                    continue
+
+                goal_W[u, v] += float(transition_weight)
+
+    # renormalize nonterminal rows
+    for a in range(G):
+        if a in terminal_nodes:
+            continue
+        s = float(goal_W[a].sum())
+        if s > 1e-12:
+            goal_W[a] /= s
+
+    # keep terminals as pure self-loop
+    for t in terminal_nodes:
+        goal_W[t, :] = 0.0
+        goal_W[t, t] = 1.0
+
+    return goal_W
+
 # ---------------------------
 # Demo
 # ---------------------------
@@ -309,7 +453,7 @@ if __name__ == "__main__":
 
     planner_kwargs = dict(
         step_size=0.7,
-        goal_sample_rate=0.005,
+        goal_sample_rate=0.01,
         max_iter=12000,
         rewire_factor=1.7,
         kd_rebuild_every=25,
@@ -335,7 +479,7 @@ if __name__ == "__main__":
     action = pickle.load(open(theta_path, "rb"))['best_theta']
 
     scale = 4
-    goals, goal_W, start_goal_idx = build_goal_graph_from_paths(paths, scale=scale)
+    goals, goal_W, start_idx, route_node_lists, terminal_nodes = build_goal_graph_from_paths(paths, scale=scale)
     segs = obstacles_to_segs(obstacles, scale=scale)
 
     env = FishGoalEnv2D(
@@ -376,23 +520,60 @@ if __name__ == "__main__":
 
     env.reset(seed=0)
     obs, reward, terminated, truncated, info = env.step(action)
-    boid_pos_RTT = np.array(info["trajectory_boid_pos"]) 
+    boid_pos_RTT = np.array(info["trajectory_boid_pos"])
+
+    goal_W = add_fractional_closest_transitions(
+        goals, goal_W,
+        route_node_lists=route_node_lists,
+        terminal_nodes=terminal_nodes,
+        segs=segs,
+        X=30.0,
+        fractions=(1/4, 2/4, 3/4),
+        transition_weight=0.1
+    )
+
+    env = FishGoalEnv2D(
+        boid_count=400 * len(paths),
+        bound=40.0,
+        max_steps=600,
+        dt=1,
+        start=np.array(start, dtype=np.float32),
+        goals=goals,
+        goal_W=goal_W,
+        segs=segs,
+        doAnimation=False,
+        returnTrajectory=True,
+        avoid_r = 1.0,
+        start_spread=1.0,
+        goal_radius = 5.0
+    )
+
+    env.reset(seed=0)
+    obs, reward, terminated, truncated, info = env.step(action)
+    boid_pos_RTT_transitions = np.array(info["trajectory_boid_pos"])
 
     H_no, extent = compute_occupancy(boid_pos_no_RTT, bins=120)
     H_rtt, _     = compute_occupancy(boid_pos_RTT, bins=120)
+    H_rtt_transitions, _     = compute_occupancy(boid_pos_RTT_transitions, bins=120)
 
     plt.figure(figsize=(12,5))
 
-    plt.subplot(1,2,1)
+    plt.subplot(1,3,1)
     plt.imshow(np.log1p(H_no), extent=extent, origin="lower",
             aspect="equal", cmap="viridis", vmin=0, vmax=10)
     plt.title("No RRT*")
     plt.colorbar(label="log occupancy")
 
-    plt.subplot(1,2,2)
+    plt.subplot(1,3,2)
     plt.imshow(np.log1p(H_rtt), extent=extent, origin="lower",
             aspect="equal", cmap="viridis", vmin=0, vmax=10)
     plt.title("With RRT*")
+    plt.colorbar(label="log occupancy")
+
+    plt.subplot(1,3,3)
+    plt.imshow(np.log1p(H_rtt_transitions), extent=extent, origin="lower",
+            aspect="equal", cmap="viridis", vmin=0, vmax=10)
+    plt.title("With RRT* and Transitions")
     plt.colorbar(label="log occupancy")
 
     plt.tight_layout()
